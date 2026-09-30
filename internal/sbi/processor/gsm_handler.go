@@ -159,7 +159,15 @@ func HandlePDUSessionEstablishmentRequest(
 			case nasMessage.ChallengeHandshakeAuthenticationProtocolUL:
 				logger.GsmLog.Infoln("Didn't Implement container type ChallengeHandshakeAuthenticationProtocolUL")
 			case nasMessage.InternetProtocolControlProtocolUL:
-				logger.GsmLog.Infoln("Didn't Implement container type InternetProtocolControlProtocolUL")
+				// The UE requests DNS via the legacy IPCP (PPP, 0x8021) method.
+				// Record it and capture the Identifier so the Accept can reply with
+				// an IPCP Configure-Nak carrying the DNS servers. Container.Contents is
+				// the IPCP packet: Code(1) Identifier(1) Length(2) Options...
+				smCtx.ProtocolConfigurationOptions.IPCPRequest = true
+				if len(container.Contents) >= 2 {
+					smCtx.ProtocolConfigurationOptions.IPCPIdentifier = container.Contents[1]
+				}
+				logger.GsmLog.Warnf("IPCP Configure-Request raw bytes: % x", container.Contents)
 			default:
 				logger.GsmLog.Infof("Unknown Container ID [%d]", container.ProtocolOrContainerID)
 			}
@@ -172,6 +180,14 @@ func HandlePDUSessionReleaseRequest(
 	smCtx *smf_context.SMContext, req *nasMessage.PDUSessionReleaseRequest,
 ) {
 	logger.GsmLog.Infof("Handle Pdu Session Release Request")
+
+	// DEBUG: log the 5GSM release cause sent by the UE
+	if req.Cause5GSM != nil {
+		logger.GsmLog.Warnf("PDU Session Release Request 5GSM Cause value: %d (0x%02x)",
+			req.Cause5GSM.GetCauseValue(), req.Cause5GSM.GetCauseValue())
+	} else {
+		logger.GsmLog.Warnf("PDU Session Release Request has NO 5GSM Cause IE")
+	}
 
 	// Retrieve PTI (Procedure transaction identity)
 	smCtx.Pti = req.GetPTI()

@@ -225,6 +225,37 @@ func BuildPDUSessionResourceModifyRequestTransfer(ctx *SMContext) ([]byte, error
 	}
 }
 
+// BuildPDUSessionResourceModifyRequestTransferForRelease builds the N2 transfer that
+// releases the given QoS flows at the NG-RAN (used for a network-initiated QoS-flow
+// removal / downgrade).
+func BuildPDUSessionResourceModifyRequestTransferForRelease(qfis []uint8) ([]byte, error) {
+	transfer := ngapType.PDUSessionResourceModifyRequestTransfer{}
+	ie := ngapType.PDUSessionResourceModifyRequestTransferIEs{}
+
+	ie.Id.Value = ngapType.ProtocolIEIDQosFlowToReleaseList
+	ie.Criticality.Value = ngapType.CriticalityPresentReject
+	ie.Value.Present = ngapType.PDUSessionResourceModifyRequestTransferIEsPresentQosFlowToReleaseList
+	ie.Value.QosFlowToReleaseList = new(ngapType.QosFlowListWithCause)
+
+	for _, qfi := range qfis {
+		item := ngapType.QosFlowWithCauseItem{}
+		item.QosFlowIdentifier.Value = int64(qfi)
+		item.Cause.Present = ngapType.CausePresentRadioNetwork
+		item.Cause.RadioNetwork = &ngapType.CauseRadioNetwork{
+			Value: ngapType.CauseRadioNetworkPresentReleaseDueTo5gcGeneratedReason,
+		}
+		ie.Value.QosFlowToReleaseList.List = append(ie.Value.QosFlowToReleaseList.List, item)
+	}
+
+	transfer.ProtocolIEs.List = append(transfer.ProtocolIEs.List, ie)
+
+	if buf, err := aper.MarshalWithParams(transfer, "valueExt"); err != nil {
+		return nil, fmt.Errorf("encode release transfer failed: %s", err)
+	} else {
+		return buf, nil
+	}
+}
+
 // TS 38.413 9.3.4.9
 func BuildPathSwitchRequestAcknowledgeTransfer(ctx *SMContext) ([]byte, error) {
 	ANUPF := ctx.Tunnel.DataPathPool.GetDefaultPath().FirstDPNode

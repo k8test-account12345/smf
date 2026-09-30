@@ -1,6 +1,7 @@
 package context
 
 import (
+	"net"
 	"encoding/hex"
 
 	"github.com/free5gc/nas"
@@ -111,18 +112,23 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 	pDUSessionEstablishmentAccept.AuthorizedQosFlowDescriptions.SetLen(uint16(len(qosDescBytes)))
 	pDUSessionEstablishmentAccept.SetQoSFlowDescriptions(qosDescBytes)
 
-	var sd [3]uint8
-
-	if byteArray, errDecodeString := hex.DecodeString(smContext.SNssai.Sd); errDecodeString != nil {
-		return nil, errDecodeString
-	} else {
-		copy(sd[:], byteArray)
-	}
-
 	pDUSessionEstablishmentAccept.SNSSAI = nasType.NewSNSSAI(nasMessage.ULNASTransportSNSSAIType)
-	pDUSessionEstablishmentAccept.SNSSAI.SetLen(4)
 	pDUSessionEstablishmentAccept.SNSSAI.SetSST(uint8(smContext.SNssai.Sst))
-	pDUSessionEstablishmentAccept.SNSSAI.SetSD(sd)
+	if smContext.SNssai.Sd == "" {
+		// SST-only S-NSSAI (no SD): encode length 1. Encoding SD=000000 (length 4)
+		// for an SST-only slice makes strict UEs treat it as a different slice from
+		// their SST-only Allowed NSSAI and regular-deactivate the PDU session (#36).
+		pDUSessionEstablishmentAccept.SNSSAI.SetLen(1)
+	} else {
+		var sd [3]uint8
+		byteArray, errDecodeString := hex.DecodeString(smContext.SNssai.Sd)
+		if errDecodeString != nil {
+			return nil, errDecodeString
+		}
+		copy(sd[:], byteArray)
+		pDUSessionEstablishmentAccept.SNSSAI.SetLen(4)
+		pDUSessionEstablishmentAccept.SNSSAI.SetSD(sd)
+	}
 
 	pDUSessionEstablishmentAccept.DNN = nasType.NewDNN(nasMessage.ULNASTransportDNNType)
 	pDUSessionEstablishmentAccept.DNN.SetDNN(smContext.Dnn)
@@ -130,7 +136,8 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 	if smContext.ProtocolConfigurationOptions.DNSIPv4Request ||
 		smContext.ProtocolConfigurationOptions.DNSIPv6Request ||
 		smContext.ProtocolConfigurationOptions.PCSCFIPv4Request ||
-		smContext.ProtocolConfigurationOptions.IPv4LinkMTURequest {
+		smContext.ProtocolConfigurationOptions.IPv4LinkMTURequest ||
+		smContext.ProtocolConfigurationOptions.IPCPRequest {
 		pDUSessionEstablishmentAccept.ExtendedProtocolConfigurationOptions = nasType.NewExtendedProtocolConfigurationOptions(
 			nasMessage.PDUSessionEstablishmentAcceptExtendedProtocolConfigurationOptionsType,
 		)
@@ -162,9 +169,38 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 
 		// MTU
 		if smContext.ProtocolConfigurationOptions.IPv4LinkMTURequest {
-			errAddIPv4LinkMTU := protocolConfigurationOptions.AddIPv4LinkMTU(1400)
+			errAddIPv4LinkMTU := protocolConfigurationOptions.AddIPv4LinkMTU(1280)
 			if errAddIPv4LinkMTU != nil {
 				logger.GsmLog.Warnln("Error while adding MTU: ", errAddIPv4LinkMTU)
+			}
+		}
+
+		// Legacy IPCP (PPP, 0x8021) DNS negotiation. Some UEs (e.g. Qualcomm-based
+		// modems) only accept DNS via IPCP and ignore the 0x000d container. Reply to
+		// the UE's IPCP Configure-Request with a Configure-Nak (code 0x03) carrying the
+		// primary/secondary DNS server addresses (RFC 1877 options 129/131).
+		if smContext.ProtocolConfigurationOptions.IPCPRequest {
+			dns4 := smContext.DNNInfo.DNS.IPv4Addr.To4()
+			if dns4 != nil {
+				// Secondary DNS: use configured IPv6? no; fall back to a public resolver.
+				sec := net.IPv4(8, 8, 4, 4).To4()
+				ipcp := []byte{
+					0x03, // Code: Configure-Nak
+					smContext.ProtocolConfigurationOptions.IPCPIdentifier, // Identifier (echo request)
+					0x00, 0x10, // Length = 16 bytes (header 4 + 6 + 6)
+					0x81, 0x06, dns4[0], dns4[1], dns4[2], dns4[3], // Opt 129: Primary DNS
+					0x83, 0x06, sec[0], sec[1], sec[2], sec[3], // Opt 131: Secondary DNS
+				}
+				ipcpUnit := &nasConvert.ProtocolOrContainerUnit{
+					ProtocolOrContainerID: nasMessage.InternetProtocolControlProtocolUL, // 0x8021
+					LengthOfContents:      uint8(len(ipcp)),
+					Contents:              ipcp,
+				}
+				protocolConfigurationOptions.ProtocolOrContainerList = append(
+					protocolConfigurationOptions.ProtocolOrContainerList, ipcpUnit)
+				logger.GsmLog.Infof("Added IPCP Configure-Nak with DNS %s to PDU Session Establishment Accept", dns4.String())
+			} else {
+				logger.GsmLog.Warnln("IPCP DNS requested but DNNInfo has no IPv4 DNS configured")
 			}
 		}
 
@@ -224,6 +260,13 @@ func BuildGSMPDUSessionReleaseCommand(smContext *SMContext, cause uint8, isTrigg
 	return m.PlainNasEncode()
 }
 
+// BuildGSMPDUSessionModificationCommand builds a network-requested PDU Session
+// Modification Command carrying the Authorized QoS Rules and QoS Flow
+// Descriptions for the QoS flows that were newly added or are to be modified
+// (state QoSFlowUnset / QoSFlowToBeModify) — e.g. as a result of a PCF
+// Npcf_PolicyAuthorization app-session that installs a new PCC rule with a
+// different 5QI. It is used by the network-initiated modification triggered
+// from the SM policy update-notify handler.
 func BuildGSMPDUSessionModificationCommand(smContext *SMContext) ([]byte, error) {
 	m := nas.NewMessage()
 	m.GsmMessage = nas.NewGsmMessage()
@@ -234,15 +277,127 @@ func BuildGSMPDUSessionModificationCommand(smContext *SMContext) ([]byte, error)
 
 	pDUSessionModificationCommand.SetExtendedProtocolDiscriminator(nasMessage.Epd5GSSessionManagementMessage)
 	pDUSessionModificationCommand.SetPDUSessionID(uint8(smContext.PDUSessionID))
-	pDUSessionModificationCommand.SetPTI(smContext.Pti)
+	// Network-requested modification: no procedure transaction identity (PTI = 0).
+	pDUSessionModificationCommand.SetPTI(0x00)
 	pDUSessionModificationCommand.SetMessageType(nas.MsgTypePDUSessionModificationCommand)
-	// pDUSessionModificationCommand.SetQosRule()
-	// pDUSessionModificationCommand.AuthorizedQosRules.SetLen()
-	// pDUSessionModificationCommand.SessionAMBR.SetSessionAMBRForDownlink([2]uint8{0x11, 0x11})
-	// pDUSessionModificationCommand.SessionAMBR.SetSessionAMBRForUplink([2]uint8{0x11, 0x11})
-	// pDUSessionModificationCommand.SessionAMBR.SetUnitForSessionAMBRForDownlink(10)
-	// pDUSessionModificationCommand.SessionAMBR.SetUnitForSessionAMBRForUplink(10)
-	// pDUSessionModificationCommand.SessionAMBR.SetLen(uint8(len(pDUSessionModificationCommand.SessionAMBR.Octet)))
+
+	// Authorized QoS Rules: one per PCC rule whose QoS flow is new / to-be-modified.
+	qoSRules := nasType.QoSRules{}
+	for _, pccRule := range smContext.PCCRules {
+		qosFlow, ok := smContext.AdditonalQosFlows[pccRule.QFI]
+		if !ok || (qosFlow.State != QoSFlowUnset && qosFlow.State != QoSFlowToBeModify) {
+			continue
+		}
+		qosRule, err := pccRule.BuildNasQoSRule(smContext, nasType.OperationCodeCreateNewQoSRule)
+		if err != nil {
+			logger.GsmLog.Warnf("Create QoS rule from pcc error: %s", err)
+			continue
+		}
+		// Reuse an already-assigned QoS rule id if present, otherwise allocate one.
+		if ruleID, exist := smContext.PCCRuleIDToQoSRuleID[pccRule.PccRuleId]; exist {
+			qosRule.Identifier = ruleID
+		} else {
+			newID, errAlloc := smContext.QoSRuleIDGenerator.Allocate()
+			if errAlloc != nil {
+				return nil, errAlloc
+			}
+			qosRule.Identifier = uint8(newID)
+			smContext.PCCRuleIDToQoSRuleID[pccRule.PccRuleId] = uint8(newID)
+		}
+		qoSRules = append(qoSRules, *qosRule)
+	}
+	if len(qoSRules) > 0 {
+		qosRulesBytes, err := qoSRules.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		pDUSessionModificationCommand.AuthorizedQosRules =
+			nasType.NewAuthorizedQosRules(nasMessage.PDUSessionModificationCommandAuthorizedQosRulesType)
+		pDUSessionModificationCommand.AuthorizedQosRules.SetLen(uint16(len(qosRulesBytes)))
+		pDUSessionModificationCommand.AuthorizedQosRules.SetQosRule(qosRulesBytes)
+	}
+
+	// Authorized QoS Flow Descriptions: carry the 5QI (and GBR bitrates for GBR
+	// flows) for each new / to-be-modified flow.
+	authDescs := nasType.QoSFlowDescs{}
+	for _, qosFlow := range smContext.AdditonalQosFlows {
+		if qosFlow.State != QoSFlowUnset && qosFlow.State != QoSFlowToBeModify {
+			continue
+		}
+		if qosDesc, err := qosFlow.BuildNasQoSDesc(nasType.OperationCodeCreateNewQoSFlowDescription); err != nil {
+			logger.GsmLog.Warnf("Create QoS Desc from qos flow error: %s", err)
+		} else {
+			authDescs = append(authDescs, qosDesc)
+		}
+	}
+	if len(authDescs) > 0 {
+		qosDescBytes, err := authDescs.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		pDUSessionModificationCommand.AuthorizedQosFlowDescriptions =
+			nasType.NewAuthorizedQosFlowDescriptions(nasMessage.PDUSessionModificationCommandAuthorizedQosFlowDescriptionsType)
+		pDUSessionModificationCommand.AuthorizedQosFlowDescriptions.SetLen(uint16(len(qosDescBytes)))
+		pDUSessionModificationCommand.AuthorizedQosFlowDescriptions.SetQoSFlowDescriptions(qosDescBytes)
+	}
+
+	return m.PlainNasEncode()
+}
+
+// BuildGSMPDUSessionModificationCommandForRemoval builds a network-requested PDU
+// Session Modification Command that DELETES the given QoS rules and QoS flow
+// descriptions from the UE - e.g. when an AsSessionWithQoS subscription is deleted,
+// downgrading the UE back to its default flow. qosRuleIDs are the NAS QoS rule
+// identifiers and qfis the QoS flow identifiers to remove.
+func BuildGSMPDUSessionModificationCommandForRemoval(
+	smContext *SMContext, qosRuleIDs, qfis []uint8,
+) ([]byte, error) {
+	m := nas.NewMessage()
+	m.GsmMessage = nas.NewGsmMessage()
+	m.GsmHeader.SetMessageType(nas.MsgTypePDUSessionModificationCommand)
+	m.GsmHeader.SetExtendedProtocolDiscriminator(nasMessage.Epd5GSSessionManagementMessage)
+	m.PDUSessionModificationCommand = nasMessage.NewPDUSessionModificationCommand(0x0)
+	cmd := m.PDUSessionModificationCommand
+
+	cmd.SetExtendedProtocolDiscriminator(nasMessage.Epd5GSSessionManagementMessage)
+	cmd.SetPDUSessionID(uint8(smContext.PDUSessionID))
+	cmd.SetPTI(0x00) // network-requested: no procedure transaction identity
+	cmd.SetMessageType(nas.MsgTypePDUSessionModificationCommand)
+
+	// Authorized QoS Rules: "delete existing QoS rule" entries. Hand-built to be
+	// spec-clean - a delete rule's content is exactly one byte (rule op-code + DQR +
+	// number-of-packet-filters=0), with no packet filters / precedence / QFI. Each
+	// entry: [identifier][length=0x0001][op<<5].
+	if len(qosRuleIDs) > 0 {
+		ruleBytes := make([]byte, 0, len(qosRuleIDs)*4)
+		for _, rid := range qosRuleIDs {
+			ruleBytes = append(ruleBytes,
+				rid, 0x00, 0x01, byte(nasType.OperationCodeDeleteExistingQoSRule)<<5)
+		}
+		cmd.AuthorizedQosRules =
+			nasType.NewAuthorizedQosRules(nasMessage.PDUSessionModificationCommandAuthorizedQosRulesType)
+		cmd.AuthorizedQosRules.SetLen(uint16(len(ruleBytes)))
+		cmd.AuthorizedQosRules.SetQosRule(ruleBytes)
+	}
+
+	// Authorized QoS Flow Descriptions: "delete existing QoS flow description".
+	if len(qfis) > 0 {
+		descs := nasType.QoSFlowDescs{}
+		for _, qfi := range qfis {
+			descs = append(descs, nasType.QoSFlowDesc{
+				QFI:           qfi,
+				OperationCode: nasType.OperationCodeDeleteExistingQoSFlowDescription,
+			})
+		}
+		descBytes, err := descs.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		cmd.AuthorizedQosFlowDescriptions =
+			nasType.NewAuthorizedQosFlowDescriptions(nasMessage.PDUSessionModificationCommandAuthorizedQosFlowDescriptionsType)
+		cmd.AuthorizedQosFlowDescriptions.SetLen(uint16(len(descBytes)))
+		cmd.AuthorizedQosFlowDescriptions.SetQoSFlowDescriptions(descBytes)
+	}
 
 	return m.PlainNasEncode()
 }

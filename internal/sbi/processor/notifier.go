@@ -117,9 +117,124 @@ func (p *Processor) HandleSMPolicyUpdateNotify(
 
 	smContext.SendUpPathChgNotification("LATE", SendUpPathChgEventExposureNotification)
 
+	// Network(PCF)-initiated PDU Session Modification: if the policy update added
+	// or changed a QoS flow (e.g. a new 5QI from a PolicyAuthorization app-session),
+	// signal it to the UE/RAN so the change actually takes effect over the air.
+	p.sendNetworkInitiatedModification(smContext)
+
+	// NOTE: network-initiated flow-REMOVAL signalling is reverted (first-version
+	// behaviour): TURBO OFF removes the flow in the core only, without sending an
+	// extra RRC/DRB reconfiguration to the UE (which was a second radio-drop
+	// opportunity). The flow clears on the UE at its next re-establishment.
+	// (sendNetworkInitiatedFlowRemoval remains defined but is no longer called.)
+
 	smContext.PostRemoveDataPath()
 
 	c.Status(http.StatusNoContent)
+}
+
+// sendNetworkInitiatedModification sends a network-requested PDU Session
+// Modification Command (N1) plus the PDU Session Resource Modify Request (N2)
+// to the AMF via N1N2MessageTransfer, when the current SM policy decision has
+// introduced QoS flows that must be signalled to the UE. If there is nothing to
+// signal (e.g. a UPF-only change) it is a no-op.
+func (p *Processor) sendNetworkInitiatedModification(smContext *smf_context.SMContext) {
+	needSignal := false
+	for _, qosFlow := range smContext.AdditonalQosFlows {
+		if qosFlow.State == smf_context.QoSFlowUnset || qosFlow.State == smf_context.QoSFlowToBeModify {
+			needSignal = true
+			break
+		}
+	}
+	if !needSignal {
+		smContext.Log.Infoln("SMPolicyUpdateNotify: no QoS flow change to signal to UE")
+		return
+	}
+
+	n1Buf, err := smf_context.BuildGSMPDUSessionModificationCommand(smContext)
+	if err != nil {
+		smContext.Log.Errorf("Build PDUSessionModificationCommand failed: %+v", err)
+		return
+	}
+	n2Buf, err := smf_context.BuildPDUSessionResourceModifyRequestTransfer(smContext)
+	if err != nil {
+		smContext.Log.Errorf("Build PDUSessionResourceModifyRequestTransfer failed: %+v", err)
+		return
+	}
+	if p.sendPduSessionModificationN1N2(smContext, n1Buf, n2Buf) {
+		smContext.Log.Infof("Network-initiated PDU Session Modification sent to UE[%s] PDUSession[%d]",
+			smContext.Supi, smContext.PDUSessionID)
+	}
+}
+
+// sendNetworkInitiatedFlowRemoval signals the UE to delete the given QoS rules /
+// flows (network-initiated downgrade), e.g. when an AsSessionWithQoS subscription
+// is deleted and the UE should fall back to its default flow.
+func (p *Processor) sendNetworkInitiatedFlowRemoval(
+	smContext *smf_context.SMContext, qosRuleIDs, qfis []uint8,
+) {
+	if len(qosRuleIDs) == 0 && len(qfis) == 0 {
+		return
+	}
+	n1Buf, err := smf_context.BuildGSMPDUSessionModificationCommandForRemoval(smContext, qosRuleIDs, qfis)
+	if err != nil {
+		smContext.Log.Errorf("Build PDUSessionModificationCommand (removal) failed: %+v", err)
+		return
+	}
+	n2Buf, err := smf_context.BuildPDUSessionResourceModifyRequestTransferForRelease(qfis)
+	if err != nil {
+		smContext.Log.Errorf("Build PDUSessionResourceModifyRequestTransfer (release) failed: %+v", err)
+		return
+	}
+	if p.sendPduSessionModificationN1N2(smContext, n1Buf, n2Buf) {
+		smContext.Log.Infof("Network-initiated PDU Session Modification (QoS flow removal) sent to UE[%s] PDUSession[%d]",
+			smContext.Supi, smContext.PDUSessionID)
+	}
+}
+
+// sendPduSessionModificationN1N2 sends a PDU Session Modification Command (N1) plus
+// the PDU Session Resource Modify Request (N2) to the AMF via N1N2MessageTransfer.
+func (p *Processor) sendPduSessionModificationN1N2(
+	smContext *smf_context.SMContext, n1Buf, n2Buf []byte,
+) bool {
+	n1n2Request := models.N1N2MessageTransferRequest{
+		BinaryDataN1Message:     n1Buf,
+		BinaryDataN2Information: n2Buf,
+		JsonData: &models.N1N2MessageTransferReqData{
+			PduSessionId: smContext.PDUSessionID,
+			N1MessageContainer: &models.N1MessageContainer{
+				N1MessageClass:   "SM",
+				N1MessageContent: &models.RefToBinaryData{ContentId: "GSM_NAS"},
+			},
+			N2InfoContainer: &models.N2InfoContainer{
+				N2InformationClass: models.N2InformationClass_SM,
+				SmInfo: &models.N2SmInformation{
+					PduSessionId: smContext.PDUSessionID,
+					N2InfoContent: &models.N2InfoContent{
+						NgapIeType: models.AmfCommunicationNgapIeType_PDU_RES_MOD_REQ,
+						NgapData:   &models.RefToBinaryData{ContentId: "N2SmInformation"},
+					},
+					SNssai: smContext.SNssai,
+				},
+			},
+		},
+	}
+
+	ctx, _, err := smf_context.GetSelf().GetTokenCtx(models.ServiceName_NAMF_COMM, models.NrfNfManagementNfType_AMF)
+	if err != nil {
+		smContext.Log.Warnf("Get namf-comm token failed: %+v", err)
+		return false
+	}
+	rspData, err := p.Consumer().
+		N1N2MessageTransfer(ctx, smContext.Supi, n1n2Request, smContext.CommunicationClientApiPrefix)
+	if err != nil || rspData == nil {
+		logger.ConsumerLog.Warnf("N1N2MessageTransfer for network-initiated PDUSessionModification failed: %+v", err)
+		return false
+	}
+	if rspData.Cause == models.N1N2MessageTransferCause_N1_MSG_NOT_TRANSFERRED {
+		smContext.Log.Warnf("N1N2MessageTransfer cause: %v", rspData.Cause)
+	}
+	return true
 }
 
 func SendUpPathChgEventExposureNotification(

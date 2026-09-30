@@ -181,6 +181,24 @@ func qerToCreateQER(qer *context.QER) *pfcp.CreateQER {
 	return createQER
 }
 
+// qerToUpdateQER builds an UpdateQER IE for an already-installed QER whose
+// parameters (e.g. the session-AMBR MBR) changed on the fly. It mirrors
+// qerToCreateQER but is emitted in a PFCP Session Modification so the UPF
+// updates the existing QER in place instead of rejecting a duplicate Create.
+func qerToUpdateQER(qer *context.QER) *pfcp.UpdateQER {
+	updateQER := new(pfcp.UpdateQER)
+
+	updateQER.QERID = new(pfcpType.QERID)
+	updateQER.QERID.QERID = qer.QERID
+	updateQER.GateStatus = qer.GateStatus
+
+	updateQER.QoSFlowIdentifier = &qer.QFI
+	updateQER.MaximumBitrate = qer.MBR
+	updateQER.GuaranteedBitrate = qer.GBR
+
+	return updateQER
+}
+
 func urrToCreateURR(urr *context.URR) *pfcp.CreateURR {
 	createURR := new(pfcp.CreateURR)
 
@@ -557,8 +575,12 @@ func BuildPfcpSessionModificationRequest(
 	}
 
 	for _, qer := range qerList {
-		if qer.State == context.RULE_INITIAL {
+		switch qer.State {
+		case context.RULE_INITIAL:
 			msg.CreateQER = append(msg.CreateQER, qerToCreateQER(qer))
+		case context.RULE_UPDATE:
+			// on-the-fly change (e.g. session-AMBR MBR): update in place
+			msg.UpdateQER = append(msg.UpdateQER, qerToUpdateQER(qer))
 		}
 		qer.State = context.RULE_CREATE
 	}

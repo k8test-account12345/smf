@@ -358,6 +358,50 @@ func GetSMContextByRef(ref string) *SMContext {
 	return smCtx
 }
 
+// GetSMContextByGpsi returns the first SM context whose GPSI matches. The GPSI
+// is carried in the SmfPduSessionSmContextCreateData the AMF sends at PDU
+// session creation, so this lets OAM/AF callers target a session by MSISDN/GPSI
+// without knowing the SUPI or PDU session id.
+func GetSMContextByGpsi(gpsi string) *SMContext {
+	var match *SMContext
+	smContextPool.Range(func(key, value interface{}) bool {
+		c, ok := value.(*SMContext)
+		if ok && c != nil && c.Gpsi == gpsi {
+			match = c
+			return false
+		}
+		return true
+	})
+	if match == nil {
+		return nil
+	}
+	// Prefer the current (canonicalRef-reachable) context so we never return a
+	// superseded orphan left over from an abrupt re-attach.
+	if cur := GetSMContextById(match.Supi, match.PDUSessionID); cur != nil {
+		return cur
+	}
+	return match
+}
+
+// ListOrphanedRefs returns the refs of SM contexts that are superseded: still in
+// the pool but no longer the canonicalRef-current context for their SUPI+PDU
+// session id (e.g. left behind when a re-attach's release of the old context
+// failed). These are safe to reap.
+func ListOrphanedRefs() []string {
+	orphans := []string{}
+	smContextPool.Range(func(key, value interface{}) bool {
+		c, ok := value.(*SMContext)
+		if !ok || c == nil {
+			return true
+		}
+		if curRef, err := ResolveRef(c.Supi, c.PDUSessionID); err == nil && curRef != c.Ref {
+			orphans = append(orphans, c.Ref)
+		}
+		return true
+	})
+	return orphans
+}
+
 func GetSMContextById(id string, pduSessID int32) *SMContext {
 	var smCtx *SMContext
 	ref, err := ResolveRef(id, pduSessID)
@@ -395,7 +439,14 @@ func RemoveSMContext(ref string) {
 	ReleaseTEID(smContext.LocalDLTeid)
 
 	smContextPool.Delete(ref)
-	canonicalRef.Delete(canonicalName(smContext.Supi, smContext.PDUSessionID))
+	// Only clear the canonical mapping if it still points to THIS ref. Otherwise
+	// (e.g. reaping a superseded orphan while a newer session holds the mapping)
+	// we would wipe the live session's canonicalRef and make future duplicates
+	// undetectable by the orphan reaper.
+	cn := canonicalName(smContext.Supi, smContext.PDUSessionID)
+	if cur, ok := canonicalRef.Load(cn); !ok || cur.(string) == ref {
+		canonicalRef.Delete(cn)
+	}
 	smContext.Log.Infof("smContext[%s] is deleted from pool", ref)
 }
 
