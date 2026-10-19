@@ -161,6 +161,13 @@ func (p *Processor) sendNetworkInitiatedModification(smContext *smf_context.SMCo
 		smContext.Log.Errorf("Build PDUSessionResourceModifyRequestTransfer failed: %+v", err)
 		return
 	}
+	if len(n2Buf) == 0 {
+		// Nothing to add/modify at the NG-RAN (no flow in QoSFlowUnset/QoSFlowToBeModify);
+		// sendPduSessionModificationN1N2 always builds an N2 container, so sending with an
+		// empty N2 would be malformed. Skip it.
+		smContext.Log.Infoln("SMPolicyUpdateNotify: no QoS flow add/modify for NG-RAN; not sending N1N2")
+		return
+	}
 	if p.sendPduSessionModificationN1N2(smContext, n1Buf, n2Buf) {
 		smContext.Log.Infof("Network-initiated PDU Session Modification sent to UE[%s] PDUSession[%d]",
 			smContext.Supi, smContext.PDUSessionID)

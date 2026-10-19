@@ -216,6 +216,15 @@ func BuildPDUSessionResourceModifyRequestTransfer(ctx *SMContext) ([]byte, error
 		}
 	}
 
+	// A QosFlowAddOrModifyRequestList is SEQUENCE (SIZE(1..maxnoofQosFlows)); APER-encoding it
+	// with zero items fails ("SEQUENCE OF Size is lower than lowerbound"). If nothing is in the
+	// QoSFlowUnset/QoSFlowToBeModify state there is nothing to add/modify at the NG-RAN, so
+	// return no transfer and let the caller omit the N2 PDU_RES_MOD_REQ rather than emit a
+	// malformed one (which otherwise re-errors on every UE-initiated modification request).
+	if len(qosFlowAddOrModifyRequestList.List) == 0 {
+		return nil, nil
+	}
+
 	resourceModifyRequestTransfer.ProtocolIEs.List = append(resourceModifyRequestTransfer.ProtocolIEs.List, ie)
 
 	if buf, err := aper.MarshalWithParams(resourceModifyRequestTransfer, "valueExt"); err != nil {
