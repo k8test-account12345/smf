@@ -255,6 +255,14 @@ func BuildPDUSessionResourceModifyRequestTransfer(ctx *SMContext) ([]byte, error
 		}
 	}
 
+	// A QosFlowAddOrModifyRequestList is SEQUENCE (SIZE(1..maxnoofQosFlows)); encoding it with
+	// zero items fails ("SEQUENCE OF Size is lower than lowerbound"). If nothing is in the
+	// QoSFlowUnset/QoSFlowToBeModify state there is nothing to add/modify at the NG-RAN, so
+	// return no transfer and let the caller omit the N2 PDU_RES_MOD_REQ.
+	if len(qosFlowAddOrModifyRequestList.List) == 0 {
+		return nil, nil
+	}
+
 	resourceModifyRequestTransfer := ngapie.PDUSessionResourceModifyRequestTransfer{
 		ProtocolIEs: &ngapie.ProtocolIEContainerPDUSessionResourceModifyRequestTransferIEs{
 			List: []ngapie.PDUSessionResourceModifyRequestTransferIEs{

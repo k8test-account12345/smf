@@ -519,7 +519,9 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 
 			if buf, err = smf_context.BuildPDUSessionResourceModifyRequestTransfer(smContext); err != nil {
 				smContext.Log.Errorf("build N2 BuildPDUSessionResourceModifyRequestTransfer failed: %v", err)
-			} else {
+			} else if len(buf) > 0 {
+				// Only attach the N2 PDU_RES_MOD_REQ when there is a QoS flow to add/modify at
+				// the NG-RAN; an empty transfer is skipped (the N1 modification command still goes).
 				response.BinaryDataN2SmInformation = related("PDU_RES_MOD", buf)
 				response.JsonData.N2SmInfo = &models.RefToBinaryData{ContentId: "PDU_RES_MOD"}
 				response.JsonData.N2SmInfoType = models.Smf_PDUSess_N2SmInfoType_PDU_RES_MOD_REQ
