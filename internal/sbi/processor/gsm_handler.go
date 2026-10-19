@@ -217,8 +217,15 @@ func (p *Processor) HandlePDUSessionModificationRequest(
 
 	if req.RequestedQosRules != nil {
 		qosRuleBytes := req.GetQoSRules()
-		if err := reqQoSRules.UnmarshalBinary(qosRuleBytes); err != nil {
+		// Use a length-bounded, operation-aware parser instead of
+		// nasType.QoSRules.UnmarshalBinary, which ignores the per-rule length and
+		// unconditionally reads the precedence + QFI octets — fields that are absent
+		// for a "delete existing QoS rule" operation — and so returns EOF on such a
+		// rule or a short IE (TS 24.501 §9.11.4.13).
+		if parsed, err := parseRequestedQoSRules(qosRuleBytes); err != nil {
 			smCtx.Log.Warning("QoS rule parse failed:", err)
+		} else {
+			reqQoSRules = parsed
 		}
 	}
 
